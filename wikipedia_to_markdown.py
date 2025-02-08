@@ -1,23 +1,30 @@
 import requests
 from bs4 import BeautifulSoup, NavigableString
-import sys
 import re
 import os
+import sys
+import urllib.parse
+import tempfile
+import pdfplumber
+
+### HTML Extraction Helpers ###
 
 def convert_heading(tag_name):
-    # Example: h2 -> level 2 -> "##"
-    level = int(tag_name[1])  # 'h2' -> 2, 'h3' -> 3, etc.
+    # Convert heading tag (h1, h2, …) to Markdown (e.g. h2 -> "##")
+    level = int(tag_name[1])
     return "#" * level
 
 def clean_text(element, inside_table=False):
     """
-    Recursively extract text and inline formatting, removing references and URLs.
-    If inside_table=True, handle lists differently (comma-separated) to avoid breaking the table layout.
+    Recursively extract text from an element.
+    Removes inline reference markers like [1], [2], etc.
     """
     parts = []
     for child in element.children:
         if isinstance(child, NavigableString):
-            parts.append(str(child))
+            text = str(child)
+            text = re.sub(r'\[\d+\]', '', text)
+            parts.append(text)
         elif child.name in ["b", "strong"]:
             inner = clean_text(child, inside_table=inside_table).strip()
             if inner:
@@ -27,11 +34,9 @@ def clean_text(element, inside_table=False):
             if inner:
                 parts.append("*" + inner + "*")
         elif child.name == "a":
-            # Just the link text
             inner = clean_text(child, inside_table=inside_table)
             parts.append(inner)
         elif child.name in ["ul", "ol"]:
-            # If inside table, join items with commas instead of bullets/new lines
             items = []
             for li in child.find_all("li", recursive=False):
                 item_text = clean_text(li, inside_table=inside_table).strip()
@@ -43,146 +48,130 @@ def clean_text(element, inside_table=False):
                 for it in items:
                     parts.append("- " + it + "\n")
         elif child.name == "sup":
-            # Skip references like [1], [2]
+            # Skip reference markers typically in <sup class="reference">
             if "class" in child.attrs and "reference" in child.attrs["class"]:
                 continue
             else:
                 inner = clean_text(child, inside_table=inside_table)
                 parts.append(inner)
         elif child.name in ["span", "div", "small", "br"]:
-            # Inline elements: just recurse
             inner = clean_text(child, inside_table=inside_table)
             parts.append(inner)
         elif child.name in ["dl", "dt", "dd"]:
-            # Definition lists
             inner = clean_text(child, inside_table=inside_table).strip()
             if inner:
                 parts.append(inner + "\n")
         else:
-            # Other tags: just recurse
             inner = clean_text(child, inside_table=inside_table)
             parts.append(inner)
     return "".join(parts)
 
-def convert_infobox_to_markdown(table_element):
+### PDF Extraction Helpers ###
+
+def download_pdf_from_wikipedia(input_url):
     """
-    Convert an infobox table into a two-column Markdown table: Property | Value.
-    We look for rows with a <th scope="row"> and a <td>.
+    Given a Wikipedia article URL, extract the page title and download the PDF
+    version via Wikipedia's REST API. Returns the path to a temporary PDF file.
     """
-    rows = table_element.find_all("tr", recursive=False)
-    entries = []
-    for row in rows:
-        # Infobox property rows often: <th scope="row">Property</th><td>Value</td>
-        header = row.find("th", recursive=False, scope="row")
-        value = row.find("td", recursive=False)
+    m = re.search(r'/wiki/(.+)$', input_url)
+    if not m:
+        raise ValueError("Invalid Wikipedia URL")
+    page_title = m.group(1)
+    encoded_page_title = urllib.parse.quote(page_title, safe='')
+    pdf_url = f"https://en.wikipedia.org/api/rest_v1/page/pdf/{encoded_page_title}"
+    headers = {"Cache-Control": "no-cache"}
+    response = requests.get(pdf_url, headers=headers)
+    response.raise_for_status()
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_file.write(response.content)
+    temp_file.close()
+    return temp_file.name
 
-        if header and value:
-            prop = clean_text(header, inside_table=True).strip()
-            val = clean_text(value, inside_table=True).strip()
-            if prop or val:
-                entries.append((prop, val))
-
-    if not entries:
-        return ""
-
-    md_lines = ["| Property | Value |", "| --- | --- |"]
-    for (prop, val) in entries:
-        md_lines.append(f"| {prop} | {val} |")
-    return "\n".join(md_lines)
-
-def convert_standard_table_to_markdown(table_element):
+def convert_pdf_table_to_markdown(table):
     """
-    Convert a generic Wikipedia HTML table to Markdown.
+    Given a table extracted by pdfplumber (a list of rows),
+    convert it to a Markdown table.
     """
-    rows = table_element.find_all("tr", recursive=False)
-    if not rows:
-        return ""
-
-    table_data = []
-    header_row = None
+    processed_rows = []
     max_cols = 0
-
-    for i, row in enumerate(rows):
-        headers = row.find_all("th", recursive=False)
-        cells = row.find_all("td", recursive=False)
-
-        if headers:
-            header_texts = [clean_text(h, inside_table=True).strip() for h in headers]
-            header_row = header_texts
-            max_cols = max(max_cols, len(header_row))
-        elif cells:
-            cell_texts = [clean_text(c, inside_table=True).strip() for c in cells]
-            max_cols = max(max_cols, len(cell_texts))
-            table_data.append(cell_texts)
-
-    if header_row is None and table_data:
-        # No explicit header, use first row as header
-        header_row = table_data.pop(0)
-
-    if not header_row:
+    for row in table:
+        if row is None:
+            continue
+        processed_row = [cell if cell is not None else "" for cell in row]
+        processed_rows.append(processed_row)
+        max_cols = max(max_cols, len(processed_row))
+    if not processed_rows:
         return ""
+    # Pad each row so that all rows have the same number of columns.
+    padded_rows = [row + [""] * (max_cols - len(row)) for row in processed_rows]
+    header = padded_rows[0]
+    separator = [":---" for _ in range(max_cols)]
+    data_rows = padded_rows[1:]
+    header_line = "| " + " | ".join(header) + " |"
+    separator_line = "| " + " | ".join(separator) + " |"
+    data_lines = ["| " + " | ".join(row) + " |" for row in data_rows]
+    markdown = "\n".join([header_line, separator_line] + data_lines)
+    return markdown
 
-    def pad_row(r, length):
-        return r + [""] * (length - len(r))
-
-    header_row = pad_row(header_row, max_cols)
-    table_data = [pad_row(r, max_cols) for r in table_data]
-
-    header_line = "| " + " | ".join(header_row) + " |"
-    separator_line = "| " + " | ".join([":---"] * max_cols) + " |"
-    rows_lines = ["| " + " | ".join(r) + " |" for r in table_data]
-
-    return "\n".join([header_line, separator_line] + rows_lines)
-
-def convert_table_to_markdown(table_element):
+def extract_pdf_tables(pdf_path):
     """
-    Decide how to convert the table.
-    If it has 'infobox' in one of its classes, treat as infobox.
-    Otherwise, standard table.
+    Open the PDF file at pdf_path and extract all tables using pdfplumber.
+    Returns a list of Markdown-formatted tables.
     """
-    table_classes = table_element.get("class", [])
-    if any("infobox" in cls.lower() for cls in table_classes):
-        return convert_infobox_to_markdown(table_element)
-    else:
-        return convert_standard_table_to_markdown(table_element)
+    pdf_tables = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                md = convert_pdf_table_to_markdown(table)
+                if md.strip():
+                    pdf_tables.append(md)
+    return pdf_tables
+
+### Main Script ###
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python script.py <wikipedia_article_url>")
         sys.exit(1)
+    input_url = sys.argv[1]
 
-    url = sys.argv[1]
+    # -------------------------
+    # Step 1. Download the PDF and extract its tables.
+    print("Downloading PDF from Wikipedia...")
+    pdf_path = download_pdf_from_wikipedia(input_url)
+    print("PDF downloaded to:", pdf_path)
+    pdf_tables = extract_pdf_tables(pdf_path)
+    os.remove(pdf_path)
+    print("Temporary PDF file removed.")
 
-    # Fetch HTML
-    r = requests.get(url)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, 'html.parser')
+    # -------------------------
+    # Step 2. Download and parse the HTML article.
+    response = requests.get(input_url)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Get page title
+    # Get the page title.
     page_title_el = soup.find("h1", id="firstHeading")
     if page_title_el:
         page_title = page_title_el.get_text().strip()
     else:
-        page_title = url.split('/')[-1].replace("_", " ")
+        page_title = input_url.split('/wiki/')[-1].replace("_", " ")
 
-    # Clean filename
-    filename = re.sub(r'[\\/*?:"<>|]', "-", page_title) + ".md"
-    home = os.path.expanduser("~")
-    download_dir = os.path.join(home, "Downloads")
-    if not os.path.exists(download_dir):
-        os.makedirs(download_dir)
-    output_path = os.path.join(download_dir, filename)
+    # Top-level heading (Obsidian-style link).
+    markdown_lines = [f"# [{page_title}]({input_url})\n"]
 
+    # Get the main content container.
     content_div = soup.find("div", id="mw-content-text")
     if not content_div:
         print("Could not find main content on this page.")
         sys.exit(1)
 
+    # Define stop sections; if encountered, stop processing further.
     stop_sections = {"references", "notes", "bibliography"}
 
-    markdown_lines = []
-    for element in content_div.find_all(["h1","h2","h3","h4","h5","h6","p","ul","ol","dl","table"], recursive=True):
-        # If a heading matches stop sections, break
+    # Process the content—but skip inline tables.
+    for element in content_div.find_all(
+            ["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "dl", "table"], recursive=True):
         if element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
             heading_text = element.get_text().strip().lower()
             if heading_text in stop_sections:
@@ -191,27 +180,34 @@ def main():
             heading_clean = clean_text(element).strip()
             if heading_clean:
                 markdown_lines.append(f"{heading_mark} {heading_clean}\n")
-
-        elif element.name in ["p", "dl"]:
+        elif element.name in ["p", "ul", "ol", "dl"]:
             text = clean_text(element).strip()
             if text:
                 markdown_lines.append(text + "\n")
-
-        elif element.name in ["ul", "ol"]:
-            text = clean_text(element).strip()
-            if text:
-                markdown_lines.append(text + "\n")
-
         elif element.name == "table":
-            table_md = convert_table_to_markdown(element)
-            if table_md:
-                markdown_lines.append(table_md + "\n")
+            # Skip inline tables.
+            continue
+
+    # -------------------------
+    # Step 3. Append the extracted tables at the end.
+    if pdf_tables:
+        markdown_lines.append("## Extracted Tables\n")
+        for i, table_md in enumerate(pdf_tables, start=1):
+            markdown_lines.append(f"### Table {i}\n")
+            markdown_lines.append(table_md + "\n")
 
     final_output = "\n".join(line.strip() for line in markdown_lines if line.strip())
 
+    # -------------------------
+    # Step 4. Write the final Markdown to a file.
+    filename = re.sub(r'[\\/*?:"<>|]', "-", page_title) + ".md"
+    home = os.path.expanduser("~")
+    download_dir = os.path.join(home, "Downloads")
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+    output_path = os.path.join(download_dir, filename)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_output)
-
     print(f"Markdown file created at: {output_path}")
 
 if __name__ == "__main__":
