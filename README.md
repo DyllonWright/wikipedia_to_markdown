@@ -1,15 +1,15 @@
 # Wikipedia to Markdown Converter
 
-This script takes a Wikipedia article URL, fetches both the HTML and PDF versions, extracts the content, and converts it to a well-structured Markdown file, which is then saved in the user's `Downloads` directory.
+This script converts a Wikipedia article into a clean, Obsidian-compatible Markdown file, preserving structure, references, and images.
 
 ## Features
 
-- **Preserves Full Article Content:** Extracts headings, paragraphs, lists, and tables without summarization.
-- **Markdown Headings:** Converts Wikipedia headings (`h1`, `h2`, etc.) into `#`, `##`, etc.
-- **Obsidian-Compatible Links:** The first heading is a clickable `[Title](URL)` instead of the full URL.
-- **Cleans Up Formatting:** Removes inline reference markers like `[1]`, `[2]`, and unnecessary formatting.
-- **PDF Table Extraction:** Downloads Wikipedia’s PDF version and extracts tables, ensuring better accuracy than HTML parsing.
-- **Tables Placed at the End:** Inline tables are skipped in the main content to improve readability, and all extracted tables are appended in a dedicated **"Extracted Tables"** section.
+- **Accurate Markdown Structure:** Converts Wikipedia headings (`h1`–`h6`) into Markdown (`#`–`######`), and lists and paragraphs are preserved.
+- **Obsidian-Compatible Images:** Extracts and converts images into `![alt text](image_url)` format.
+- **Inline References Preserved:** Inline citation markers (e.g., `[1]`) are escaped and preserved as `\[1]`.
+- **Reference Section Included:** A `## References` section is appended with the extracted footnotes numbered and listed.
+- **PDF Table Extraction:** Downloads the Wikipedia PDF and extracts tabular data, appending it as proper Markdown tables with blank lines before each (required by Obsidian).
+- **Outputs Clean `.md` File:** The final Markdown file is saved in the user's `Downloads` directory with the article title as the filename.
 
 ## Requirements
 
@@ -21,13 +21,18 @@ This script takes a Wikipedia article URL, fetches both the HTML and PDF version
 ## Usage
 
 1. Save the script as `wikipedia_to_markdown.py`.
-2. Run the script with:
+2. Run it from the command line with a Wikipedia article URL:
    ```bash
    python wikipedia_to_markdown.py "https://en.wikipedia.org/wiki/Example_Article"
    ```
-3. The resulting Markdown file will be saved in your `Downloads` directory.
 
-## Notes
+## Output
 
-- The script ensures tables are correctly formatted and does not alter article content.
-- If tables are crucial to the article flow, consider manually repositioning them after conversion.
+- A Markdown `.md` file will be created in your `~/Downloads` folder.
+- It will contain:
+  - A top-level heading linking to the source
+  - All main content (headings, paragraphs, lists)
+  - Obsidian-style image embeds
+  - Escaped inline reference markers
+  - A full References section
+  - Extracted PDF tables with proper formatting
