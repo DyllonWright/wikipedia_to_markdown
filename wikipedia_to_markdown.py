@@ -14,32 +14,39 @@ def convert_heading(tag_name):
     level = int(tag_name[1])
     return "#" * level
 
-def clean_text(element, inside_table=False):
+def clean_text(element, inside_table=False, base_url=""):
     """
     Recursively extract text from an element.
-    Removes inline reference markers like [1], [2], etc.
+    Replaces inline reference markers [1] with an escaped version \[1].
+    Also processes images (converted to Obsidian image markdown).
     """
     parts = []
     for child in element.children:
         if isinstance(child, NavigableString):
             text = str(child)
-            text = re.sub(r'\[\d+\]', '', text)
+            # Escape inline reference numbers
+            text = re.sub(r'\[(\d+)\]', r'\\[\1]', text)
             parts.append(text)
+        elif child.name == "img":
+            alt = child.get("alt", "")
+            src = child.get("src", "")
+            src = urllib.parse.urljoin(base_url, src) if base_url else src
+            parts.append(f"![{alt}]({src})")
         elif child.name in ["b", "strong"]:
-            inner = clean_text(child, inside_table=inside_table).strip()
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url).strip()
             if inner:
                 parts.append("**" + inner + "**")
         elif child.name in ["i", "em"]:
-            inner = clean_text(child, inside_table=inside_table).strip()
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url).strip()
             if inner:
                 parts.append("*" + inner + "*")
         elif child.name == "a":
-            inner = clean_text(child, inside_table=inside_table)
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url)
             parts.append(inner)
         elif child.name in ["ul", "ol"]:
             items = []
             for li in child.find_all("li", recursive=False):
-                item_text = clean_text(li, inside_table=inside_table).strip()
+                item_text = clean_text(li, inside_table=inside_table, base_url=base_url).strip()
                 if item_text:
                     items.append(item_text)
             if inside_table:
@@ -48,23 +55,42 @@ def clean_text(element, inside_table=False):
                 for it in items:
                     parts.append("- " + it + "\n")
         elif child.name == "sup":
-            # Skip reference markers typically in <sup class="reference">
+            # For reference markers, extract the number and output it as escaped.
             if "class" in child.attrs and "reference" in child.attrs["class"]:
-                continue
+                ref_text = child.get_text()
+                match = re.search(r'\[(\d+)\]', ref_text)
+                if match:
+                    parts.append(f"\\[{match.group(1)}]")
             else:
-                inner = clean_text(child, inside_table=inside_table)
+                inner = clean_text(child, inside_table=inside_table, base_url=base_url)
                 parts.append(inner)
         elif child.name in ["span", "div", "small", "br"]:
-            inner = clean_text(child, inside_table=inside_table)
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url)
             parts.append(inner)
         elif child.name in ["dl", "dt", "dd"]:
-            inner = clean_text(child, inside_table=inside_table).strip()
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url).strip()
             if inner:
                 parts.append(inner + "\n")
         else:
-            inner = clean_text(child, inside_table=inside_table)
+            inner = clean_text(child, inside_table=inside_table, base_url=base_url)
             parts.append(inner)
     return "".join(parts)
+
+def extract_references(soup, base_url=""):
+    """
+    Extracts references from the Wikipedia article.
+    Looks for an ordered list with class "references" and returns a list of
+    dictionaries with reference number and cleaned text.
+    """
+    references = []
+    ref_ol = soup.find("ol", class_="references")
+    if ref_ol:
+        li_items = ref_ol.find_all("li", recursive=False)
+        for li in li_items:
+            ref_text = clean_text(li, base_url=base_url).strip()
+            ref_number = len(references) + 1
+            references.append({"number": ref_number, "text": ref_text})
+    return references
 
 ### PDF Extraction Helpers ###
 
@@ -90,7 +116,8 @@ def download_pdf_from_wikipedia(input_url):
 def convert_pdf_table_to_markdown(table):
     """
     Given a table extracted by pdfplumber (a list of rows),
-    convert it to a Markdown table.
+    convert it to a Markdown table for Obsidian.
+    Prepend an empty line before the table.
     """
     processed_rows = []
     max_cols = 0
@@ -102,16 +129,16 @@ def convert_pdf_table_to_markdown(table):
         max_cols = max(max_cols, len(processed_row))
     if not processed_rows:
         return ""
-    # Pad each row so that all rows have the same number of columns.
+    # Pad each row so all rows have the same number of columns.
     padded_rows = [row + [""] * (max_cols - len(row)) for row in processed_rows]
     header = padded_rows[0]
-    separator = [":---" for _ in range(max_cols)]
+    separator = ["---" for _ in range(max_cols)]
     data_rows = padded_rows[1:]
     header_line = "| " + " | ".join(header) + " |"
     separator_line = "| " + " | ".join(separator) + " |"
     data_lines = ["| " + " | ".join(row) + " |" for row in data_rows]
     markdown = "\n".join([header_line, separator_line] + data_lines)
-    return markdown
+    return "\n" + markdown  # Prepend a newline for an empty line before the table
 
 def extract_pdf_tables(pdf_path):
     """
@@ -166,10 +193,8 @@ def main():
         print("Could not find main content on this page.")
         sys.exit(1)
 
-    # Define stop sections; if encountered, stop processing further.
+    # Stop processing once these sections are encountered.
     stop_sections = {"references", "notes", "bibliography"}
-
-    # Process the content—but skip inline tables.
     for element in content_div.find_all(
             ["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "dl", "table"], recursive=True):
         if element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
@@ -177,11 +202,11 @@ def main():
             if heading_text in stop_sections:
                 break
             heading_mark = convert_heading(element.name)
-            heading_clean = clean_text(element).strip()
+            heading_clean = clean_text(element, base_url=input_url).strip()
             if heading_clean:
                 markdown_lines.append(f"{heading_mark} {heading_clean}\n")
         elif element.name in ["p", "ul", "ol", "dl"]:
-            text = clean_text(element).strip()
+            text = clean_text(element, base_url=input_url).strip()
             if text:
                 markdown_lines.append(text + "\n")
         elif element.name == "table":
@@ -189,17 +214,27 @@ def main():
             continue
 
     # -------------------------
-    # Step 3. Append the extracted tables at the end.
+    # Step 3. Extract references and append them before tables.
+    references = extract_references(soup, base_url=input_url)
+    if references:
+        markdown_lines.append("## References\n")
+        for ref in references:
+            # Each reference is prefixed with its number using an escaped reference marker.
+            markdown_lines.append(f"\\[{ref['number']}] {ref['text']}\n")
+
+    # -------------------------
+    # Step 4. Append the extracted PDF tables.
     if pdf_tables:
         markdown_lines.append("## Extracted Tables\n")
         for i, table_md in enumerate(pdf_tables, start=1):
             markdown_lines.append(f"### Table {i}\n")
             markdown_lines.append(table_md + "\n")
 
-    final_output = "\n".join(line.strip() for line in markdown_lines if line.strip())
+    # Join lines without stripping to preserve blank lines.
+    final_output = "\n".join(markdown_lines)
 
     # -------------------------
-    # Step 4. Write the final Markdown to a file.
+    # Step 5. Write the final Markdown to a file.
     filename = re.sub(r'[\\/*?:"<>|]', "-", page_title) + ".md"
     home = os.path.expanduser("~")
     download_dir = os.path.join(home, "Downloads")
